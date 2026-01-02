@@ -2,10 +2,11 @@ import os
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Generator, Tuple
 
 import librosa
+import numpy as np
 import torch
-import perth
 import pyloudnorm as ln
 
 from safetensors.torch import load_file
@@ -127,7 +128,6 @@ class ChatterboxTurboTTS:
         self.tokenizer = tokenizer
         self.device = device
         self.conds = conds
-        self.watermarker = perth.PerthImplicitWatermarker()
 
     @classmethod
     def from_local(cls, ckpt_dir, device) -> 'ChatterboxTurboTTS':
@@ -292,5 +292,117 @@ class ChatterboxTurboTTS:
             n_cfm_timesteps=2,
         )
         wav = wav.squeeze(0).detach().cpu().numpy()
-        watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+        return torch.from_numpy(wav).unsqueeze(0)
+
+    def generate_stream(
+        self,
+        text,
+        repetition_penalty=1.2,
+        min_p=0.00,
+        top_p=0.95,
+        audio_prompt_path=None,
+        exaggeration=0.0,
+        cfg_weight=0.0,
+        temperature=0.8,
+        top_k=1000,
+        norm_loudness=True,
+        chunk_size=50,
+    ) -> Generator[Tuple[np.ndarray, int], None, None]:
+        """
+        Generate audio in streaming mode, yielding chunks as they are generated.
+        
+        Args:
+            text: Text to synthesize
+            chunk_size: Number of speech tokens to accumulate before yielding audio chunk
+            ... (other args same as generate)
+            
+        Yields:
+            Tuple of (audio_chunk as numpy array, sample_rate)
+        """
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
+        else:
+            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        if cfg_weight > 0.0 or exaggeration > 0.0 or min_p > 0.0:
+            logger.warning("CFG, min_p and exaggeration are not supported by Turbo version and will be ignored.")
+
+        # Norm and tokenize text
+        text = punc_norm(text)
+        text_tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        text_tokens = text_tokens.input_ids.to(self.device)
+
+        # Stream speech tokens from T3
+        token_buffer = []
+        hift_cache_source = torch.zeros(1, 1, 0).to(device=self.device, dtype=self.s3gen.dtype)
+        prev_wav_len = 0
+        
+        for speech_token in self.t3.inference_turbo_stream(
+            t3_cond=self.conds.t3,
+            text_tokens=text_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        ):
+            # Filter OOV and EOS tokens
+            token_val = speech_token.item()
+            if token_val >= 6561:
+                continue
+                
+            token_buffer.append(speech_token)
+            
+            # When we have enough tokens, generate audio chunk
+            if len(token_buffer) >= chunk_size:
+                chunk_tokens = torch.cat(token_buffer, dim=0).view(-1).to(self.device)
+                
+                # Add silence token for smoother output
+                silence = torch.tensor([S3GEN_SIL]).long().to(self.device)
+                chunk_tokens_with_silence = torch.cat([chunk_tokens, silence])
+                
+                # Generate audio using full s3gen inference
+                wav, hift_cache_source = self._generate_audio_chunk_full(
+                    chunk_tokens_with_silence,
+                    hift_cache_source,
+                )
+                
+                # Only yield new samples (avoid overlap)
+                if prev_wav_len > 0 and wav.shape[0] > prev_wav_len:
+                    wav_chunk = wav[prev_wav_len:]
+                else:
+                    wav_chunk = wav
+                
+                prev_wav_len = 0  # Reset for next chunk
+                yield wav_chunk, self.sr
+                token_buffer = []
+        
+        # Process remaining tokens
+        if token_buffer:
+            chunk_tokens = torch.cat(token_buffer, dim=0).view(-1).to(self.device)
+            silence = torch.tensor([S3GEN_SIL, S3GEN_SIL, S3GEN_SIL]).long().to(self.device)
+            chunk_tokens_with_silence = torch.cat([chunk_tokens, silence])
+            
+            wav, _ = self._generate_audio_chunk_full(
+                chunk_tokens_with_silence,
+                hift_cache_source,
+            )
+            
+            yield wav, self.sr
+
+    def _generate_audio_chunk_full(
+        self, 
+        speech_tokens: torch.Tensor, 
+        cache_source: torch.Tensor,
+    ) -> Tuple[np.ndarray, torch.Tensor]:
+        """Generate audio chunk from speech tokens using full s3gen inference."""
+        speech_tokens = speech_tokens.unsqueeze(0) if speech_tokens.dim() == 1 else speech_tokens
+        
+        # Use the full inference which handles prompt tokens internally
+        wav, new_cache_source = self.s3gen.inference(
+            speech_tokens=speech_tokens,
+            ref_dict=self.conds.gen,
+            n_cfm_timesteps=2,
+        )
+        
+        wav_np = wav.squeeze(0).detach().cpu().numpy()
+        return wav_np, new_cache_source
